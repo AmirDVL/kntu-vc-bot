@@ -69,6 +69,8 @@ Startup currently requires the admin university credentials and numeric Telegram
 
 Full setup, transfer limits, supported workflows and operational details: [usage guide](docs/usage.md).
 
+For a persistent Linux deployment, see [the systemd deployment guide](docs/deployment.md).
+
 ## Architecture
 
 ```mermaid

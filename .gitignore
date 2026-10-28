@@ -6,6 +6,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 .data/
+confidential/
+*.pem
+*.key
+*.ppk
 login-success.png
 *.log
 *.sqlite3
