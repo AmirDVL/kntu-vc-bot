@@ -170,6 +170,7 @@ async def enable_notifications(update, context):
     async with s.lock:
         await s.client.ensure_login()
         store.enable(update.effective_user.id, s.client.account_id, s.client.username, s.client.password)
+        context.application.bot_data["notification_worker"].baseline_overview.add(update.effective_user.id)
     context.application.bot_data["notification_worker"].changed(update.effective_user.id)
     await notification_settings(update, context)
 
@@ -732,6 +733,7 @@ async def init(application):
         try:
             await client.login()
             store.enable(admin, client.account_id, username, password)
+            application.bot_data["notification_worker"].baseline_overview.add(admin)
         except Exception:
             print("Admin alerts need account reconnection; Telegram bot remains available.", flush=True)
         finally:

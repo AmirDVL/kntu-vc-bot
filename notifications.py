@@ -93,7 +93,7 @@ class NotificationStore:
         db.execute('''INSERT OR IGNORE INTO notifications(owner,account,cmid,revision,kind,payload)
                       VALUES(?,?,?,?,?,?)''', (owner, account, cmid, revision, kind, json.dumps(payload)))
 
-    def observe(self, owner, events, now):
+    def observe(self, owner, events, now, announce_baseline=True):
         """Commit one complete scan and its alerts atomically. Failed scans never call this."""
         sub = self.subscription(owner)
         if not sub or not sub["enabled"]:
@@ -132,7 +132,7 @@ class NotificationStore:
                 event = json.loads(assignment["payload"]) if assignment else None
                 if not assignment or not assignment["active"] or event.get("submitted") or not event["due"] or event["due"] <= now or assignment["revision"] != row["revision"]:
                     db.execute("UPDATE notifications SET state='cancelled' WHERE id=?", (row["id"],))
-            if not sub["initialized"]:
+            if not sub["initialized"] and announce_baseline:
                 self.enqueue(db, owner, account, 0, 1, "baseline", {"events": events})
             db.execute("UPDATE subscriptions SET initialized=1,last_scan=?,last_success=?,failures=0 WHERE owner=?", (now, now, owner))
 
@@ -181,6 +181,7 @@ class NotificationWorker:
         self.clients = {}
         self.wake = asyncio.Event()
         self.next_scan = {}
+        self.baseline_overview = set()
 
     def changed(self, owner):
         self.next_scan.pop(owner, None)
@@ -204,7 +205,8 @@ class NotificationWorker:
         current = self.store.subscription(owner)
         if not current or not current["enabled"] or current["secret"] != sub["secret"]:
             return  # Account/preferences changed while the scan awaited Moodle.
-        self.store.observe(owner, events, time.time())
+        self.store.observe(owner, events, time.time(), announce_baseline=owner in self.baseline_overview)
+        self.baseline_overview.discard(owner)
 
     async def deliver(self):
         with self.store.db() as db:
