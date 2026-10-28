@@ -14,7 +14,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, LinkPreviewOptions, MenuButtonCommands, ReplyKeyboardRemove, Update
+from telegram.error import BadRequest
+import ui
 from telegram.constants import ChatType
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -41,6 +43,8 @@ class UserSession:
     reviewed: dict | None = None
     final_files: list | None = None
     confirm_action: str | None = None
+    upload_name: str = ""
+    upload_nonce: str = ""
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def clear_upload(self):
@@ -49,6 +53,7 @@ class UserSession:
         self.folder, self.cmid, self.files, self.confirm = None, None, [], None
         self.statement, self.final_cmid = None, None
         self.save_declaration = ""
+        self.upload_name, self.upload_nonce = "", ""
         self.reviewed, self.final_files, self.confirm_action = None, None, None
 
 
@@ -73,6 +78,83 @@ async def reply(update, text, **kwargs):
     # Always plain text: university content must not become Telegram markup.
     for start in range(0, max(len(text), 1), 3900):
         await update.effective_message.reply_text(text[start:start + 3900], **(kwargs if start + 3900 >= len(text) else {}))
+
+
+async def card(update, text, buttons=None, edit=True):
+    parts = ui.html_chunks(text)
+    for index, part in enumerate(parts):
+        options = dict(parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        if index == len(parts) - 1 and buttons:
+            options["reply_markup"] = buttons
+        if edit and update.callback_query and len(parts) == 1:
+            try:
+                await update.callback_query.edit_message_text(part, **options)
+            except BadRequest as error:
+                if "message is not modified" not in str(error).lower():
+                    raise
+        else:
+            await update.effective_message.reply_text(part, **options)
+
+
+async def busy(update, text):
+    return await update.effective_message.reply_text(text)
+
+
+async def home(update, context):
+    uid = update.effective_user.id
+    s = sessions.get(uid)
+    active = s is not None and time.monotonic() - s.touched <= TTL
+    if active:
+        s.touched = time.monotonic()
+        text = "🎓 <b>KNTU · Coursework</b>\n\nYour university account is connected.\nBrowse assignments, download materials, or continue your homework upload."
+        rows = [[ui.button("📚 Browse assignments", "list:upcoming:0", "primary")]]
+        if s.cmid:
+            text += f"\n\n📎 <b>Upload in progress</b>\n{ui.e(s.upload_name)} · {len(s.files)} file(s) staged"
+            rows.append([ui.button("Continue upload →", "staging", "primary")])
+        rows += [[ui.button("Help", "help"), ui.button("Account", "account")]]
+    else:
+        text = "🎓 <b>KNTU · Coursework</b>\n\nYour assignments, files, and homework submissions—in one place.\n\nConnect your own university account to get started."
+        rows = [[ui.button("Connect university account →", "connect", "primary")]]
+        if uid == context.application.bot_data["admin_id"]:
+            rows.append([ui.button("Quick sign in · admin", "login")])
+        rows.append([ui.button("How it works", "help")])
+    await card(update, text, ui.markup(*rows))
+
+
+async def help_screen(update, context):
+    await card(update, "❓ <b>From assignment to turn-in</b>\n\n"
+               "<b>1 · Browse</b>\nOpen Assignments and choose upcoming or overdue work.\n\n"
+               "<b>2 · Prepare</b>\nRead the description and limits. Tap Add homework, then attach files as <b>documents</b> to preserve their names and formats.\n\n"
+               "<b>3 · Review &amp; save</b>\nCheck the assignment and file list before confirming. The bot downloads Moodle’s saved files to check their actual bytes.\n\n"
+               "<b>4 · Turn in</b>\nA saved draft still needs final submission. Only a verified submitted status gets a green confirmation. An uncertain result offers a safe recheck.\n\n"
+               "<b>Good to know</b>\nTelegram allows transfers up to 20 MiB per incoming document. University sessions expire after 30 minutes of inactivity. Receipt details stay available after reconnecting.\n\n"
+               "Commands still work: /due · /upload ID · /review · /verify ID · /cancel · /logout",
+               ui.markup([ui.button("⌂ Home", "home", "primary")]))
+
+
+async def account(update, context):
+    session(update)
+    await card(update, "👤 <b>Your university session</b>\n\nConnected to your own Moodle account.\nSessions expire after 30 minutes of inactivity. Signing out removes this session and any staged files; verification receipts remain available after reconnecting.",
+               ui.markup([ui.button("Sign out…", "logout_prompt", "danger")], [ui.button("‹ Home", "home")]))
+
+
+async def staging(update, context):
+    s = session(update)
+    if not s.cmid:
+        await card(update, "📎 <b>No upload in progress</b>\n\nChoose an assignment, then tap <b>Add homework</b>.",
+                   ui.markup([ui.button("Browse assignments →", "list:upcoming:0", "primary")]))
+        return
+    listing = ui.file_list([{"name": p.name, "size": p.stat().st_size} for p in s.files])
+    text = f"📎 <b>Your homework upload</b>\n\n<b>{ui.e(s.upload_name)}</b>\nAssignment {s.cmid} · {len(s.files)} file(s) staged\n\n"
+    text += listing or "Attach your first file as a document."
+    text += "\n\nSend more documents, or review the files below. <b>Staged files have not been saved to Moodle.</b>"
+    rows = []
+    if s.files:
+        rows.append([ui.button("Review homework →", "review", "primary")])
+        for i, path in enumerate(s.files):
+            rows.append([ui.button(f"✕ Remove {path.name[:40]}", f"remove:{s.upload_nonce}:{i}")])
+    rows += [[ui.button("Assignment details", f"open:{s.cmid}")], [ui.button("Discard staged files…", "discard_prompt", "danger")]]
+    await card(update, text, ui.markup(*rows))
 
 
 def session(update):
@@ -144,29 +226,15 @@ def receipt_text(receipt):
 async def start(update, context):
     if not private(update):
         return
-    await reply(update, "University homework bot\n\n"
-                "/connect — sign in to your own university account\n"
-                "/login — admin's account from .env\n"
-                "/due — timeline across all courses (includes overdue)\n"
-                "/assignment ID — description, dates, status, file list\n"
-                "/files ID — download assignment attachments\n"
-                "/upload ID — view limits and prepare homework\n"
-                "Send documents, then /review to confirm saving.\n"
-                "/finalize ID — review Moodle's separate final submission\n"
-                "/verify ID — check stored file fingerprints and turn-in status again\n"
-                "/cancel — discard staged files\n"
-                "/logout — remove session and staged files\n\n"
-                "Send homework as documents to preserve filenames and formats. "
-                "Sessions expire after 30 minutes of inactivity; restart requires reconnecting.")
+    await reply(update, "🎓 KNTU VC · Your coursework, closer.", reply_markup=ui.keyboard())
+    await home(update, context)
 
 
 async def connect(update, context):
     if not private(update):
         return
     connecting[update.effective_user.id] = (None, time.monotonic())
-    await reply(update, "Send your university username next, then your password when prompted. "
-                "Credentials pass through Telegram's bot chat (not end-to-end encrypted). "
-                "I delete your credential messages and keep the session only in memory. /cancel to stop.")
+    await reply(update, "🔐 Connect · Step 1 of 2\n\nSend your university username or email.\n\nCredential messages are deleted and your session stays in memory. Telegram bot chats are not end-to-end encrypted.\n\n/cancel to stop.", reply_markup=ReplyKeyboardRemove())
 
 
 async def establish(update, username, password):
@@ -182,7 +250,7 @@ async def establish(update, username, password):
         old.clear_upload()
         await old.client.close()
     sessions[uid] = UserSession(client)
-    await reply(update, "Signed in to your university account. Use /due.")
+    await reply(update, "✓ University account connected.", reply_markup=ui.keyboard())
 
 
 async def login(update, context):
@@ -192,7 +260,10 @@ async def login(update, context):
         await reply(update, "Use /connect to sign in to your own account.")
         return
     username, password, _ = settings()
+    status = await busy(update, "🔐 Connecting to your university account…")
     await establish(update, username, password)
+    await status.edit_text("✓ Connected to your university account.")
+    await home(update, context)
 
 
 async def text(update, context):
@@ -200,8 +271,14 @@ async def text(update, context):
         return
     uid = update.effective_user.id
     pending = connecting.get(uid)
+    navigation = {ui.HOME: home, ui.ASSIGNMENTS: due, ui.UPLOAD: staging, ui.HELP: help_screen}
+    if update.effective_message.text in navigation:
+        connecting.pop(uid, None)
+        await navigation[update.effective_message.text](update, context)
+        return
     if not pending:
-        await reply(update, "Use /start for commands. Send homework as a document after /upload ID.")
+        await card(update, "Choose an action below. To add homework, open an assignment and tap <b>Add homework</b>.",
+                   ui.markup([ui.button("📚 Assignments", "list:upcoming:0", "primary"), ui.button("⌂ Home", "home")]))
         return
     try:
         await update.effective_message.delete()
@@ -215,38 +292,53 @@ async def text(update, context):
         raise VCError("Sign-in timed out. Use /connect again.")
     if username is None:
         connecting[uid] = (update.effective_message.text.strip(), began)
-        await reply(update, "Now send your university password. I will delete that message too.")
+        await reply(update, "🔐 Connect · Step 2 of 2\n\nSend your university password. This message will also be deleted.\n\n/cancel to stop.")
     else:
         connecting.pop(uid, None)
+        status = await busy(update, "🔐 Connecting to your university account…")
         await establish(update, username, update.effective_message.text)
+        await status.edit_text("✓ Connected to your university account.")
+        await home(update, context)
 
 
-async def due(update, context):
+async def due(update, context, kind="upcoming", page=0):
     s = session(update)
     async with s.lock:
         events = await s.client.assignments()
-    if not events:
-        await reply(update, "No due assignments appear in your Moodle action timeline. "
-                    "Assignments without due dates or already completed may be absent.")
-        return
-    now = time.time()
-    lines = ["Moodle assignment timeline (Tehran time):"]
-    for e in events:
-        date = datetime.fromtimestamp(e["due"], ZoneInfo("Asia/Tehran")).strftime("%Y-%m-%d %H:%M")
-        lines.append(f"\n{'Overdue' if e['due'] < now else 'Due'} {date}\n{e['name']}\n{e['course']}\n/assignment {e['id']}")
-    await reply(update, "\n".join(lines))
+    text, buttons = ui.assignment_list(events, kind, page, time.time())
+    await card(update, text, buttons)
 
 
 async def assignment(update, context):
     s, cmid = session(update), cmid_arg(context)
     async with s.lock:
         d = await s.client.detail(cmid)
+        can_upload = True
         try:
-            limits = (await s.client.rules(cmid)).summary()
-        except VCError as e:
-            limits = str(e)
-    files = "\n".join(f"• {f['name']}" for f in d["attachments"]) or "No attached files."
-    await reply(update, f"{d['name']}\n{d['dates']}\n\n{d['description']}\n\n{d['status']}\n\n{limits}\n\n{files}\n\n/files {cmid}\n/upload {cmid}\n{d['url']}")
+            limits = ui.rules_text(await s.client.rules(cmid))
+        except VCError as error:
+            limits, can_upload = ui.e(str(error)), False
+    state = {"submitted": "✅ Submitted", "draft": "🟠 Draft · final submission pending", "new": "⚪ No submission yet"}.get(d["submission_state"], ui.e(d.get("submission_label") or "Submission state unavailable · check Moodle"))
+    text = f"📘 <b>{ui.e(d['name'])}</b>\n{ui.e(d.get('course', ''))}\n\n{ui.e(d['dates'])}\n\n<b>{state}</b>"
+    if d.get("timing"):
+        text += f"\n{ui.e(d['timing'])}"
+    text += f"\n\n<b>Description</b>\n{ui.e(d['description'])}\n\n{limits}"
+    if d["attachments"]:
+        text += "\n\n<b>Course materials</b>\n" + "\n".join("📄 " + ui.e(f["name"]) for f in d["attachments"])
+    rows = []
+    if d["attachments"]:
+        rows.append([ui.button(f"↓ Download materials ({len(d['attachments'])})", f"download:{cmid}")])
+    if s.cmid == cmid:
+        rows.append([ui.button("Continue homework upload →", "staging", "primary")])
+    elif can_upload:
+        rows.append([ui.button("＋ Add homework", f"upload:{cmid}", "primary")])
+    if d["submission_state"] == "draft":
+        rows.append([ui.button("Review final submission →", f"finish:{cmid}", "success")])
+    if submission_service(update, context, s).latest(cmid):
+        rows.append([ui.button("↻ Verify turn-in", f"check:{cmid}")])
+    rows += [[ui.button("Open Moodle ↗", url=f"https://vc.kntu.ac.ir/mod/assign/view.php?id={cmid}")],
+             [ui.button("‹ Assignments", "list:upcoming:0"), ui.button("⌂ Home", "home")]]
+    await card(update, text, ui.markup(*rows))
 
 
 async def files(update, context):
@@ -277,19 +369,29 @@ async def files(update, context):
                         await update.effective_message.reply_document(handle, filename=dest.name, read_timeout=120, write_timeout=120)
 
 
-async def upload(update, context):
+async def upload(update, context, replace=False):
     s, cmid = session(update), cmid_arg(context)
+    if s.cmid == cmid and not replace:
+        await staging(update, context)
+        return
+    if s.cmid and not replace:
+        await card(update, f"📎 <b>An upload is already in progress</b>\n\n{ui.e(s.upload_name)} · {len(s.files)} staged file(s).\nSwitching assignments discards these local files. Moodle files are unaffected.",
+                   ui.markup([ui.button("Continue current upload", "staging", "primary")],
+                             [ui.button("Discard & switch assignment", f"switch:{s.upload_nonce}:{cmid}", "danger")]))
+        return
     async with s.lock:
         submission_service(update, context, s).check_pending(cmid)
         rules = await s.client.rules(cmid)
         detail = await s.client.detail(cmid)
         s.clear_upload()
         s.cmid = cmid
+        s.upload_name = detail["name"]
+        if detail.get("course"):
+            s.upload_name += " · " + detail["course"]
+        s.upload_nonce = secrets.token_hex(4)
         s.folder = Path(tempfile.mkdtemp(prefix="vc-upload-"))
-    await reply(update, f"Preparing: {detail['name']}\n{rules.summary()}\n\n"
-                "Existing Moodle files will be preserved. Send your homework as documents. "
-                "Telegram's hosted bot service lets me download files up to 20 MiB each, even if Moodle allows more. "
-                "Then /review; /cancel discards the staged files. Nothing is saved to Moodle until you confirm.")
+    await card(update, f"📎 <b>Add your homework</b>\n\n<b>{ui.e(detail['name'])}</b>\n{ui.e(detail['dates'])}\n\n{ui.rules_text(rules)}\n\n<b>Next:</b> tap the paperclip and send your file as a <b>document</b>. You can send multiple documents.\n\nExisting Moodle files stay in place. Files are saved only after your review and confirmation.",
+               ui.markup([ui.button("View staged files", "staging")], [ui.button("Cancel upload…", "discard_prompt", "danger")]))
 
 
 async def document(update, context):
@@ -323,7 +425,9 @@ async def document(update, context):
         s.files.append(path)
         s.confirm = None  # Any change invalidates an earlier review button.
         s.reviewed = None
-    await reply(update, f"Staged {name} ({doc.file_size:,} bytes). {len(s.files)} file(s) ready. /review when finished.")
+        s.upload_nonce = secrets.token_hex(4)
+    await card(update, f"📎 <b>File received</b>\n\n{ui.e(name)} · {ui.size(path.stat().st_size)}\n{len(s.files)} file(s) staged for <b>{ui.e(s.upload_name)}</b>.\n\nSend another document or review your homework. <b>Nothing has been saved to Moodle yet.</b>",
+               ui.markup([ui.button("Review homework →", "review", "primary")], [ui.button("Manage staged files", "staging")]), edit=False)
 
 
 async def review(update, context):
@@ -339,11 +443,12 @@ async def review(update, context):
         s.reviewed = await submission_service(update, context, s).prepare(s.cmid, s.files)
         s.confirm = secrets.token_hex(8)
         s.confirm_action = "save"
-        listing = "\n".join(f"• {f['name']} ({f['size']:,} bytes)\nSHA-256: {f['sha256']}" for f in s.reviewed["staged"])
-        declaration = f"\n\nBy saving, you accept this Moodle statement:\n{rules.declaration}" if rules.declaration else ""
-        await reply(update, f"Save to assignment {s.cmid}?\n{listing}\n\n{rules.summary()}\n"
-                    f"This saves files on Moodle. Some assignments require an additional final submission.{declaration}",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Save homework to Moodle", callback_data=f"save:{s.confirm}")]]))
+        listing = ui.file_list(s.reviewed["staged"])
+        declaration = f"\n\n<b>Moodle declaration</b>\n{ui.e(rules.declaration)}\nSaving accepts this statement." if rules.declaration else ""
+        text = f"📝 <b>Review your homework</b>\n\n<b>{ui.e(s.upload_name)}</b>\nAssignment {s.cmid}\n\n{listing}\n\n{ui.rules_text(rules)}\n\nSaving sends these files to Moodle. If Moodle saves a draft, you will be prompted to finalize it.{declaration}"
+        await card(update, text, ui.markup([ui.button("Save homework to Moodle", f"save:{s.confirm}", "success")],
+                                         [ui.button("Edit files", "staging"), ui.button("File fingerprints", "fingerprints")],
+                                         [ui.button("Discard…", "discard_prompt", "danger")]))
 
 
 async def finalize(update, context):
@@ -356,10 +461,11 @@ async def finalize(update, context):
         s.statement, s.final_cmid = form["statement"], cmid
         s.confirm = secrets.token_hex(8)
         s.confirm_action = "final"
-        listing = "\n".join(f"• {f['name']} ({f['size']:,} bytes)\nSHA-256: {f['sha256']}" for f in s.final_files)
-        await reply(update, f"Final submission for assignment {cmid}:\n\n{form['statement']}\n\n"
-                    f"{listing}\n\nConfirm only if these are the correct files and you accept the statement above. Final submission may lock further edits.",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Accept statement and submit", callback_data=f"final:{s.confirm}")]]))
+        listing = ui.file_list(s.final_files)
+        d = await s.client.detail(cmid)
+        await card(update, f"📤 <b>Final turn-in</b>\n\n<b>{ui.e(d['name'])}</b>\nAssignment {cmid}\n\n{listing}\n\n<b>Moodle declaration</b>\n{ui.e(form['statement'])}\n\nConfirm that these are the correct files and you accept this statement. <b>Final turn-in may lock further edits.</b>",
+                   ui.markup([ui.button("Accept & turn in homework", f"final:{s.confirm}", "success")],
+                             [ui.button("File fingerprints", "final_fingerprints"), ui.button("‹ Assignment", f"open:{cmid}")]))
 
 
 async def callback(update, context):
@@ -373,25 +479,38 @@ async def callback(update, context):
             raise VCError("This confirmation has expired. Request /review or /finalize again.")
         s.confirm = None
         service = submission_service(update, context, s)
-        if action == "save":
-            if not s.reviewed:
-                raise VCError("No reviewed file fingerprints. Request /review again.")
-            receipt = await service.save(s.cmid, s.files, s.save_declaration, s.reviewed)
-            if receipt["state"] in {"draft", "submitted"}:
-                s.clear_upload()
-            await reply(update, receipt_text(receipt))
-        elif action == "final" and s.statement and s.final_cmid:
-            receipt = await service.finalize(s.final_cmid, s.statement, s.final_files)
-            s.statement, s.final_cmid = None, None
-            await reply(update, receipt_text(receipt))
+        progress = await busy(update, "⏳ Sending homework to Moodle…\nI’ll check the stored file bytes and turn-in status before reporting the result.")
+        try:
+            if action == "save":
+                if not s.reviewed:
+                    raise VCError("No reviewed file fingerprints. Request /review again.")
+                receipt = await service.save(s.cmid, s.files, s.save_declaration, s.reviewed)
+                if receipt["state"] in {"draft", "submitted"}:
+                    s.clear_upload()
+            elif action == "final" and s.statement and s.final_cmid:
+                receipt = await service.finalize(s.final_cmid, s.statement, s.final_files)
+                s.statement, s.final_cmid = None, None
+            else:
+                raise VCError("This confirmation expired. Open the assignment to continue.")
+        except Exception:
+            await progress.edit_text("⚠️ This action did not complete with a verified result. Check the receipt or Moodle before retrying.")
+            raise
+        await progress.edit_text("✓ Moodle check complete." if receipt["state"] != "unknown" else "⚠️ Turn-in could not be verified. Use the safe recheck below.")
+        await show_receipt(update, receipt)
         await update.callback_query.edit_message_reply_markup(reply_markup=None)
+
 
 
 async def verify(update, context):
     s, cmid = session(update), cmid_arg(context)
     async with s.lock:
         receipt = await submission_service(update, context, s).verify(cmid)
-    await reply(update, receipt_text(receipt))
+    await show_receipt(update, receipt)
+
+
+async def show_receipt(update, receipt):
+    text, buttons = ui.receipt_card(receipt)
+    await card(update, text, buttons, edit=False)
 
 
 async def cancel(update, context):
@@ -401,7 +520,8 @@ async def cancel(update, context):
     connecting.pop(uid, None)
     if uid in sessions:
         sessions[uid].clear_upload()
-    await reply(update, "Cancelled. Staged files removed.")
+    await reply(update, "Upload cancelled. Staged files removed; Moodle files are unchanged.", reply_markup=ui.keyboard())
+    await home(update, context)
 
 
 async def logout(update, context):
@@ -412,14 +532,105 @@ async def logout(update, context):
     if s:
         s.clear_upload()
         await s.client.close()
-    await reply(update, "Session and staged files removed from this bot.")
+    await reply(update, "Signed out. Session and staged files removed.", reply_markup=ui.keyboard())
+    await home(update, context)
 
 
 async def on_error(update, context):
     # Do not log Update/exception objects: either may contain passwords or tokens.
     if isinstance(update, Update) and private(update):
         message = str(context.error) if isinstance(context.error, VCError) else "Request failed. Check Moodle before retrying a submission."
-        await reply(update, message)
+        await card(update, "⚠️ <b>Action needs attention</b>\n\n" + ui.e(message), ui.markup([ui.button("⌂ Home", "home"), ui.button("Connect account", "connect")]), edit=False)
+
+
+async def receipt_details(update, context):
+    s, cmid = session(update), cmid_arg(context)
+    receipt = submission_service(update, context, s).latest(cmid)
+    if not receipt:
+        raise VCError("No verification receipt exists for this assignment yet.")
+    await reply(update, receipt_text(receipt), reply_markup=ui.markup(
+        [ui.button("↻ Verify again", f"check:{cmid}", "primary"), ui.button("‹ Assignment", f"open:{cmid}")]))
+
+
+async def navigate(update, context):
+    if not private(update):
+        return
+    query = update.callback_query
+    data = query.data
+    await query.answer("Checking Moodle…" if data.split(":")[0] in {
+        "list", "open", "download", "upload", "finish", "check", "review"} else None)
+    routes = {"home": home, "help": help_screen, "connect": connect, "login": login,
+              "account": account, "staging": staging, "review": review, "cancel": cancel, "logout": logout}
+    if data in routes:
+        if data == "home":
+            connecting.pop(update.effective_user.id, None)
+        await routes[data](update, context)
+        return
+    if data == "logout_prompt":
+        session(update)
+        await card(update, "👤 <b>Sign out?</b>\n\nYour university session and staged files will be removed. Saved Moodle files and verification receipts are kept.",
+                   ui.markup([ui.button("Sign out", "logout", "danger")], [ui.button("Keep me connected", "home", "primary")]))
+        return
+    if data == "discard_prompt":
+        s = session(update)
+        if not s.cmid:
+            await staging(update, context)
+            return
+        await card(update, "🗑 <b>Discard staged homework?</b>\n\nThis removes only the local files waiting to be saved. It does not delete files already on Moodle.",
+                   ui.markup([ui.button("Discard staged files", f"discard:{s.upload_nonce}", "danger")], [ui.button("Keep editing", "staging", "primary")]))
+        return
+    if data in {"fingerprints", "final_fingerprints"}:
+        s = session(update)
+        fingerprints = s.final_files if data == "final_fingerprints" else s.reviewed["staged"] if s.reviewed else None
+        if not fingerprints:
+            raise VCError("This review expired. Review your homework again.")
+        await card(update, "🔎 <b>File fingerprints</b>\n\n" + ui.file_list(fingerprints, hashes=True),
+                   ui.markup([ui.button("‹ Back to review", f"finish:{s.final_cmid}" if data == "final_fingerprints" else "review")]))
+        return
+    parts = data.split(":")
+    if len(parts) == 2 and parts[0] == "discard":
+        s = session(update)
+        if not s.upload_nonce or not secrets.compare_digest(parts[1], s.upload_nonce):
+            raise VCError("Your staged files changed. Open My upload before discarding them.")
+        await cancel(update, context)
+        return
+    if len(parts) == 3 and parts[0] == "switch" and parts[2].isdigit():
+        s = session(update)
+        if not s.upload_nonce or not secrets.compare_digest(parts[1], s.upload_nonce):
+            raise VCError("Your staged files changed. Choose the new assignment again.")
+        original_args = context.args
+        context.args = [parts[2]]
+        try:
+            await upload(update, context, replace=True)
+        finally:
+            context.args = original_args
+        return
+    if len(parts) == 3 and parts[0] == "list" and parts[1] in {"upcoming", "overdue"} and parts[2].isdigit():
+        await due(update, context, parts[1], int(parts[2]))
+        return
+    if len(parts) == 3 and parts[0] == "remove" and parts[2].isdigit():
+        s = session(update)
+        async with s.lock:
+            index = int(parts[2])
+            if not s.upload_nonce or not secrets.compare_digest(parts[1], s.upload_nonce) or index >= len(s.files):
+                raise VCError("This file list changed. Open My upload to see the current files.")
+            path = s.files.pop(index)
+            path.unlink(missing_ok=True)
+            s.confirm, s.reviewed, s.confirm_action = None, None, None
+            s.upload_nonce = secrets.token_hex(4)
+        await staging(update, context)
+        return
+    handlers = {"open": assignment, "download": files, "upload": upload,
+                "finish": finalize, "check": verify, "receipt": receipt_details}
+    if len(parts) == 2 and parts[0] in handlers and parts[1].isdigit() and 0 < int(parts[1]) < 2**63:
+        original_args = context.args
+        context.args = [parts[1]]
+        try:
+            await handlers[parts[0]](update, context)
+        finally:
+            context.args = original_args
+        return
+    raise VCError("This button is no longer available. Open Home to continue.")
 
 
 def guarded(handler):
@@ -445,6 +656,17 @@ async def reap(application):
 
 async def init(application):
     application.bot_data["reaper"] = asyncio.create_task(reap(application))
+    await application.bot.set_my_commands([
+        BotCommand("start", "Open your coursework dashboard"), BotCommand("due", "Browse upcoming and overdue assignments"),
+        BotCommand("connect", "Connect your university account"), BotCommand("review", "Review staged homework"),
+        BotCommand("cancel", "Discard staged files"), BotCommand("help", "How homework submission works"),
+        BotCommand("logout", "Sign out of your university account")])
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    await application.bot.set_my_short_description("Your KNTU assignments, files and verified homework submissions.")
+    await application.bot.set_my_description(
+        "Browse your KNTU assignments and download course materials without opening every course. "
+        "Add homework, review the files and confirm saving. The bot checks Moodle's stored file bytes "
+        "and distinguishes a draft from a verified final turn-in. Start below to connect your university account.")
     print("Telegram connection initialized; starting polling.", flush=True)
 
 
@@ -469,10 +691,11 @@ def main():
     application = (Application.builder().token(token).post_init(init).post_shutdown(shutdown).build())
     application.bot_data["admin_id"] = int(admin)
     application.bot_data["receipts"] = ReceiptStore(ROOT / ".data" / "receipts.sqlite3")
-    for name, handler in {"start": start, "help": start, "connect": connect, "login": login, "due": due,
+    for name, handler in {"start": start, "menu": start, "help": help_screen, "connect": connect, "login": login, "due": due,
                           "assignment": assignment, "files": files, "upload": upload, "review": review,
-                          "finalize": finalize, "verify": verify, "cancel": cancel, "logout": logout}.items():
+                          "finalize": finalize, "verify": verify, "receipt": receipt_details, "cancel": cancel, "logout": logout}.items():
         application.add_handler(CommandHandler(name, guarded(handler)))
+    application.add_handler(CallbackQueryHandler(navigate, pattern=r"^(?!save:|final:).+"))
     application.add_handler(CallbackQueryHandler(callback, pattern=r"^(save|final):[0-9a-f]{16}$"))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.Document.ALL, document))
     application.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, text))

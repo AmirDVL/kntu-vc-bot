@@ -15,6 +15,8 @@ Configure `.env` from `.env.example`. The existing names `User`, `Password`, `To
 
 ## User flow
 
+Tap **Start** for the dashboard. Use the persistent **Assignments**, **My upload**, **Home** and **Help** buttons, or the commands below. Assignment lists have upcoming/overdue filters and five entries per page. Open an assignment to download materials or add homework. The upload screen supports removing individual staged files and reviewing before saving; discarding files or switching assignments requires confirmation. File changes invalidate old save/remove/discard buttons. Receipt summaries keep the next step visible; **Receipt details** shows full hashes and timestamp evidence.
+
 1. Start a **private** chat with the bot and use `/connect`. Send your username and then password when prompted. Credential messages are deleted; Telegram bot chats are not end-to-end encrypted. The admin can use `/login` instead.
 2. `/due` lists Moodle's cross-course action timeline, including overdue entries, with IDs. It paginates the calendar API. Completed work and assignments without due dates may not appear. The corresponding website view is **میز کار → گاه‌شمار فعالیت‌ها**.
 3. `/assignment ID` shows the description, dates, submission status, attachment names, current limits and Moodle link. `/files ID` sends attached files.

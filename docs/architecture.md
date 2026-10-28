@@ -22,6 +22,7 @@ flowchart LR
 | Component | Responsibility | Does not own |
 | --- | --- | --- |
 | `bot.py` | Private-chat commands, session ownership, document staging, explicit confirmation, receipt formatting | Moodle's submission rules or deadline decisions |
+| `ui.py` | Native colored buttons, menus, filtered/paginated lists, compact receipts, escaped HTML and lossless message splitting | Submission state or permission decisions |
 | `vc_client.py` | Session authentication, form/config parsing, calendar pagination, uploads, download-back hashing, fresh status observations | Telegram users or receipt persistence |
 | `submission.py` | Reviewed manifests, durable attempt states, conservative recovery, receipt ownership | Authentication credentials or homework byte storage |
 | `demo.py` | Offline HTTP simulation using the real client and receipt service | Evidence that the live university accepts submissions |

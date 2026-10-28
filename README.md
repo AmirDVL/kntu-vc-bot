@@ -45,6 +45,8 @@ This is a reproducible failure demonstration, not evidence of live Moodle compat
 
 ## Use the bot
 
+The interface uses Telegram's native colored buttons: blue navigation, green save/turn-in confirmations, and red discard/sign-out actions. A persistent keyboard keeps Assignments, My upload, Home and Help within reach. Assignments have upcoming/overdue filters and pagination; an upload can be reviewed and managed without typing IDs. Compact receipts expose the full timing/hash evidence through **Receipt details**. Commands remain available as shortcuts. Button colors depend on support in the user's Telegram client.
+
 Requires Python 3.11+ and a Telegram bot token. Copy `.env.example` to `.env` and set the values locally:
 
 ```sh
@@ -83,7 +85,7 @@ flowchart LR
     Service --> SQLite[(Verification receipts)]
 ```
 
-The implementation uses Python, asyncio, python-telegram-bot, HTTPX, Beautiful Soup and SQLite. Browser inspection informed the university SSO and Moodle adapters; the running bot uses HTTP sessions rather than a browser process.
+The implementation uses Python, asyncio, python-telegram-bot, HTTPX, Beautiful Soup and SQLite. `ui.py` owns Telegram presentation, safe HTML formatting, menus and compact receipts. Browser inspection informed the university SSO and Moodle adapters; the running bot uses HTTP sessions rather than a browser process.
 
 [Architecture, state transitions and tradeoffs](docs/architecture.md) explain the decisions, their costs and their limits. [Tests](tests/) exercise wrong bytes with matching names/sizes, teacher-versus-student file separation, response loss, changing state, confirmation binding and receipt ownership. GitHub Actions runs the tests and demo on Windows/Linux with Python 3.11/3.14.
 

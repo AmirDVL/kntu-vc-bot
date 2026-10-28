@@ -39,6 +39,7 @@ See [`tests/test_client.py`](../tests/test_client.py) and [`tests/test_verificat
 - Draft status after an ambiguous final-submit response.
 - Changed file bytes after user review.
 - A successful POST response contradicted by a fresh draft status.
+- Native button styles, filtered/paginated assignment lists, safe lossless HTML splitting, callback routing, stale file-removal/discard protection and the button-driven review/save/receipt flow.
 
 The CI matrix runs tests and the offline demo on Windows and Linux, with Python 3.11 and 3.14. CI uses no live-service secrets.
 

@@ -220,7 +220,7 @@ class VCClient:
         title = main.select_one("h2")
         intro = main.select_one("#intro")
         links = []
-        for a in main.select('a[href*="/pluginfile.php/"]'):
+        for a in (intro.select('a[href*="/pluginfile.php/"]') if intro else []):
             url = urljoin(BASE, a["href"])
             if url not in [v["url"] for v in links]:
                 links.append({"name": a.get_text(" ", strip=True) or Path(urlparse(url).path).name, "url": url})
@@ -246,6 +246,9 @@ class VCClient:
                 if label and value and label.get_text(" ", strip=True).casefold() in {"last modified", "آخرین تغییر"}:
                     modified = value.get_text(" ", strip=True)
         remaining = status.select_one(".timeremaining") if status else None
+        first_status = status.select_one("tr td") if status else None
+        page_title = doc.title.get_text(" ", strip=True) if doc.title else ""
+        course = page_title.split(": ", 1)[0] if ": " in page_title else ""
         dates = main.select_one('[data-region="activity-dates"]')
         if intro:
             intro = soup(str(intro))
@@ -257,6 +260,8 @@ class VCClient:
                 "dates": dates.get_text(" ", strip=True) if dates else "",
                 "status": status.get_text(" ", strip=True) if status else "",
                 "submission_state": state, "submission_files": submission_files,
+                "submission_label": first_status.get_text(" ", strip=True) if first_status else "",
+                "course": course,
                 "modified": modified, "timing": remaining.get_text(" ", strip=True) if remaining else "",
                 "server_date": response.headers.get("date", ""), "checked_at": utc_now(),
                 "attachments": links, "url": str(response.url)}
