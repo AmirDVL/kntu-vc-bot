@@ -17,6 +17,7 @@ import httpx
 from telegram import BotCommand, LinkPreviewOptions, MenuButtonCommands, ReplyKeyboardRemove, Update
 from telegram.error import BadRequest
 import ui
+from notifications import NotificationStore, NotificationWorker
 from telegram.constants import ChatType
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
@@ -111,13 +112,14 @@ async def home(update, context):
         if s.cmid:
             text += f"\n\n📎 <b>Upload in progress</b>\n{ui.e(s.upload_name)} · {len(s.files)} file(s) staged"
             rows.append([ui.button("Continue upload →", "staging", "primary")])
-        rows += [[ui.button("Help", "help"), ui.button("Account", "account")]]
+        rows += [[ui.button("🔔 Notifications", "notifications"), ui.button("Account", "account")], [ui.button("Help", "help")]]
     else:
         text = "🎓 <b>KNTU · Coursework</b>\n\nYour assignments, files, and homework submissions—in one place.\n\nConnect your own university account to get started."
         rows = [[ui.button("Connect university account →", "connect", "primary")]]
         if uid == context.application.bot_data["admin_id"]:
             rows.append([ui.button("Quick sign in · admin", "login")])
         rows.append([ui.button("How it works", "help")])
+        rows.append([ui.button("🔔 Notification settings", "notifications")])
     await card(update, text, ui.markup(*rows))
 
 
@@ -134,8 +136,48 @@ async def help_screen(update, context):
 
 async def account(update, context):
     session(update)
-    await card(update, "👤 <b>Your university session</b>\n\nConnected to your own Moodle account.\nSessions expire after 30 minutes of inactivity. Signing out removes this session and any staged files; verification receipts remain available after reconnecting.",
+    await card(update, "👤 <b>Your university session</b>\n\nConnected to your own Moodle account.\nInteractive sessions expire after 30 minutes of inactivity. Background alerts continue if enabled. Signing out stops alerts and removes their saved login, this session and any staged files; verification receipts remain available after reconnecting.",
                ui.markup([ui.button("Sign out…", "logout_prompt", "danger")], [ui.button("‹ Home", "home")]))
+
+
+async def notification_settings(update, context):
+    store = context.application.bot_data["notifications"]
+    sub = store.subscription(update.effective_user.id)
+    enabled = bool(sub and sub["enabled"])
+    text = f"🔔 <b>Assignment notifications · {'On' if enabled else 'Off'}</b>\n\n"
+    text += "🆕 New assignments when first detected\n🗓 Changes to due dates, including added/removed deadlines\n⏰ Reminders at <b>1 week · 3 days · 2 days · 1 day · 12 hours</b> before the deadline.\n\n"
+    text += "Courses are checked about every 5 minutes. Submitted assignments do not receive deadline reminders. The first scan sends one overview of existing work.\n\n"
+    if enabled:
+        if sub["last_success"]:
+            date = datetime.fromtimestamp(sub["last_success"], ui.TZ).strftime("%d %b · %H:%M Tehran")
+            text += f"<b>Last successful check</b>\n{date}\n"
+        else:
+            text += "<b>First check is pending.</b>\n"
+        if sub["failures"]:
+            text += f"Consecutive failed checks: {sub['failures']}\n"
+        text += "\nAlerts continue when you close Telegram and after a server restart. Your background login is stored encrypted on the server. Turning alerts off removes it."
+        rows = [[ui.button("Turn alerts off", "alerts_off", "danger")]]
+    else:
+        text += "<b>Background login</b>\nEnabling alerts saves your university login encrypted on this server so checks can continue after inactivity or restarts. The encryption key is stored separately from the database. Turning alerts off removes the saved login."
+        rows = [[ui.button("Enable background alerts", "alerts_on", "success")]]
+    rows.append([ui.button("↻ Refresh settings", "notifications"), ui.button("⌂ Home", "home")])
+    await card(update, text, ui.markup(*rows))
+
+
+async def enable_notifications(update, context):
+    s = session(update)
+    store = context.application.bot_data["notifications"]
+    async with s.lock:
+        await s.client.ensure_login()
+        store.enable(update.effective_user.id, s.client.account_id, s.client.username, s.client.password)
+    context.application.bot_data["notification_worker"].changed(update.effective_user.id)
+    await notification_settings(update, context)
+
+
+async def disable_notifications(update, context):
+    context.application.bot_data["notifications"].disable(update.effective_user.id)
+    context.application.bot_data["notification_worker"].changed(update.effective_user.id)
+    await notification_settings(update, context)
 
 
 async def staging(update, context):
@@ -237,7 +279,7 @@ async def connect(update, context):
     await reply(update, "🔐 Connect · Step 1 of 2\n\nSend your university username or email.\n\nCredential messages are deleted and your session stays in memory. Telegram bot chats are not end-to-end encrypted.\n\n/cancel to stop.", reply_markup=ReplyKeyboardRemove())
 
 
-async def establish(update, username, password):
+async def establish(update, username, password, context=None):
     client = VCClient(username, password)
     try:
         await client.login()
@@ -250,6 +292,17 @@ async def establish(update, username, password):
         old.clear_upload()
         await old.client.close()
     sessions[uid] = UserSession(client)
+    if context:
+        store = context.application.bot_data["notifications"]
+        sub = store.subscription(uid)
+        if sub and sub["enabled"]:
+            import hashlib
+            account = hashlib.sha256(f"kntu:{client.account_id}".encode()).hexdigest()
+            if account == sub["account"]:
+                store.enable(uid, client.account_id, username, password)
+            else:
+                store.disable(uid)
+            context.application.bot_data["notification_worker"].changed(uid)
     await reply(update, "✓ University account connected.", reply_markup=ui.keyboard())
 
 
@@ -261,7 +314,7 @@ async def login(update, context):
         return
     username, password, _ = settings()
     status = await busy(update, "🔐 Connecting to your university account…")
-    await establish(update, username, password)
+    await establish(update, username, password, context)
     await status.edit_text("✓ Connected to your university account.")
     await home(update, context)
 
@@ -296,7 +349,7 @@ async def text(update, context):
     else:
         connecting.pop(uid, None)
         status = await busy(update, "🔐 Connecting to your university account…")
-        await establish(update, username, update.effective_message.text)
+        await establish(update, username, update.effective_message.text, context)
         await status.edit_text("✓ Connected to your university account.")
         await home(update, context)
 
@@ -528,11 +581,13 @@ async def logout(update, context):
     if not private(update):
         return
     connecting.pop(update.effective_user.id, None)
+    context.application.bot_data["notifications"].disable(update.effective_user.id)
+    context.application.bot_data["notification_worker"].changed(update.effective_user.id)
     s = sessions.pop(update.effective_user.id, None)
     if s:
         s.clear_upload()
         await s.client.close()
-    await reply(update, "Signed out. Session and staged files removed.", reply_markup=ui.keyboard())
+    await reply(update, "Signed out. Session and staged files removed. Background alerts are off and the saved notification login was deleted.", reply_markup=ui.keyboard())
     await home(update, context)
 
 
@@ -560,7 +615,8 @@ async def navigate(update, context):
     await query.answer("Checking Moodle…" if data.split(":")[0] in {
         "list", "open", "download", "upload", "finish", "check", "review"} else None)
     routes = {"home": home, "help": help_screen, "connect": connect, "login": login,
-              "account": account, "staging": staging, "review": review, "cancel": cancel, "logout": logout}
+              "account": account, "staging": staging, "review": review, "cancel": cancel, "logout": logout,
+              "notifications": notification_settings, "alerts_on": enable_notifications, "alerts_off": disable_notifications}
     if data in routes:
         if data == "home":
             connecting.pop(update.effective_user.id, None)
@@ -568,7 +624,7 @@ async def navigate(update, context):
         return
     if data == "logout_prompt":
         session(update)
-        await card(update, "👤 <b>Sign out?</b>\n\nYour university session and staged files will be removed. Saved Moodle files and verification receipts are kept.",
+        await card(update, "👤 <b>Sign out?</b>\n\nYour university session and staged files will be removed. Background alerts will stop and their saved login will be deleted. Saved Moodle files and verification receipts are kept.",
                    ui.markup([ui.button("Sign out", "logout", "danger")], [ui.button("Keep me connected", "home", "primary")]))
         return
     if data == "discard_prompt":
@@ -660,6 +716,7 @@ async def init(application):
         BotCommand("start", "Open your coursework dashboard"), BotCommand("due", "Browse upcoming and overdue assignments"),
         BotCommand("connect", "Connect your university account"), BotCommand("review", "Review staged homework"),
         BotCommand("cancel", "Discard staged files"), BotCommand("help", "How homework submission works"),
+        BotCommand("notifications", "Manage assignment and deadline alerts"),
         BotCommand("logout", "Sign out of your university account")])
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
     await application.bot.set_my_short_description("Your KNTU assignments, files and verified homework submissions.")
@@ -667,11 +724,30 @@ async def init(application):
         "Browse your KNTU assignments and download course materials without opening every course. "
         "Add homework, review the files and confirm saving. The bot checks Moodle's stored file bytes "
         "and distinguishes a draft from a verified final turn-in. Start below to connect your university account.")
+    store = application.bot_data["notifications"]
+    admin = application.bot_data["admin_id"]
+    if store.subscription(admin) is None:
+        username, password, _ = settings()
+        client = VCClient(username, password)
+        try:
+            await client.login()
+            store.enable(admin, client.account_id, username, password)
+        except Exception:
+            print("Admin alerts need account reconnection; Telegram bot remains available.", flush=True)
+        finally:
+            await client.close()
+    application.bot_data["notification_task"] = asyncio.create_task(application.bot_data["notification_worker"].run())
     print("Telegram connection initialized; starting polling.", flush=True)
 
 
 async def shutdown(application):
     application.bot_data["reaper"].cancel()
+    task = application.bot_data["notification_task"]
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
     for s in sessions.values():
         s.clear_upload()
         await s.client.close()
@@ -691,8 +767,11 @@ def main():
     application = (Application.builder().token(token).post_init(init).post_shutdown(shutdown).build())
     application.bot_data["admin_id"] = int(admin)
     application.bot_data["receipts"] = ReceiptStore(ROOT / ".data" / "receipts.sqlite3")
+    store = NotificationStore(ROOT / ".data" / "notifications.sqlite3", ROOT / ".data" / "notifications.key")
+    application.bot_data["notifications"] = store
+    application.bot_data["notification_worker"] = NotificationWorker(store, application.bot)
     for name, handler in {"start": start, "menu": start, "help": help_screen, "connect": connect, "login": login, "due": due,
-                          "assignment": assignment, "files": files, "upload": upload, "review": review,
+                          "assignment": assignment, "files": files, "upload": upload, "review": review, "notifications": notification_settings,
                           "finalize": finalize, "verify": verify, "receipt": receipt_details, "cancel": cancel, "logout": logout}.items():
         application.add_handler(CommandHandler(name, guarded(handler)))
     application.add_handler(CallbackQueryHandler(navigate, pattern=r"^(?!save:|final:).+"))

@@ -67,6 +67,7 @@ Startup currently requires the admin university credentials and numeric Telegram
 | `/review` | Review file fingerprints and explicitly confirm saving |
 | `/finalize ID` | Review and confirm a separate final submission, when required |
 | `/verify ID` | Read-only verification using the latest stored receipt |
+| `/notifications` | Enable/pause background checks, new-assignment alerts, deadline changes and reminders |
 | `/cancel`, `/logout` | Discard staged files or remove the session |
 
 Full setup, transfer limits, supported workflows and operational details: [usage guide](docs/usage.md).
@@ -74,6 +75,12 @@ Full setup, transfer limits, supported workflows and operational details: [usage
 For a persistent Linux deployment, see [the systemd deployment guide](docs/deployment.md).
 
 ## Architecture
+
+Assignment alerts check every enrolled course's assignment index about every five minutes. They announce newly detected work, including assignments without deadlines, and changes to due dates (including added or removed deadlines). Reminders are scheduled for **7 days, 3 days, 2 days, 1 day and 12 hours** before the due date. Submitted assignments are excluded from reminders. The first scan sends one overview instead of announcing every historical assignment separately. After downtime, only the nearest crossed reminder milestone is delivered.
+
+The configured admin's alerts are enabled automatically on the first notification-enabled deployment, using the existing server login. Other users opt in via **Home → Notifications → Enable background alerts**. Opt-in stores their login encrypted with a Fernet key outside the SQLite database so checks survive inactivity and restart. Disabling alerts or signing out deletes that saved login and cancels pending notifications. Back up/protect the key separately; this is encryption at rest, not protection from a compromised server operator.
+
+Assignment snapshots, date revisions, reminder identities and a delivery outbox persist in SQLite. Acknowledged messages are not resent after restart. Transient Telegram failures are retried with backoff; a crash or timeout after Telegram accepted a message but before acknowledgement can still cause a duplicate. Polling and network downtime can delay detection, so reminders are not an exact-time delivery guarantee.
 
 ```mermaid
 flowchart LR
@@ -85,16 +92,16 @@ flowchart LR
     Service --> SQLite[(Verification receipts)]
 ```
 
-The implementation uses Python, asyncio, python-telegram-bot, HTTPX, Beautiful Soup and SQLite. `ui.py` owns Telegram presentation, safe HTML formatting, menus and compact receipts. Browser inspection informed the university SSO and Moodle adapters; the running bot uses HTTP sessions rather than a browser process.
+The implementation uses Python, asyncio, python-telegram-bot, HTTPX, Beautiful Soup and SQLite. `ui.py` owns Telegram presentation, safe HTML formatting, menus and compact receipts. `notifications.py` owns encrypted alert subscriptions, complete course snapshots, reminder schedules and a durable delivery outbox. Browser inspection informed the university SSO and Moodle adapters; the running bot uses HTTP sessions rather than a browser process.
 
 [Architecture, state transitions and tradeoffs](docs/architecture.md) explain the decisions, their costs and their limits. [Tests](tests/) exercise wrong bytes with matching names/sizes, teacher-versus-student file separation, response loss, changing state, confirmation binding and receipt ownership. GitHub Actions runs the tests and demo on Windows/Linux with Python 3.11/3.14.
 
 ## Important boundaries
 
 - This is a session-protected web integration for KNTU's Moodle, not a general-purpose Moodle client or an official university service.
-- Telegram bot chats are not end-to-end encrypted. Credential messages are deleted; sessions remain in memory and expire. Do not publish configuration, logs, receipts or coursework.
+- Telegram bot chats are not end-to-end encrypted. Credential messages are deleted; interactive sessions remain in memory and expire. Background alerts require explicit opt-in to an encrypted saved login (the configured admin uses the existing server login). Do not publish configuration, keys, logs, receipts or coursework.
 - An exact downloaded hash plus submitted status is an observation of Moodle's current web interface. It cannot certify academic correctness, future state, or an exact server commit time. Receipts report client and server timing evidence separately.
 - Hosted Telegram limits document downloads to 20 MiB and sending to 50 MiB. Moodle may allow more. Existing folders, online-text submissions and file replacement use the web interface.
-- Updates run sequentially. Notifications, distributed processing and broad public-hosting hardening are outside the current scope. Unresolved writes can require manual investigation.
+- Interactive updates run sequentially; the background monitor uses separate university sessions. Distributed processing and broad public-hosting hardening are outside the current scope. Unresolved writes can require manual investigation.
 
 Read [the verification plan](docs/verification.md) before relying on the bot for a deadline.

@@ -40,6 +40,7 @@ See [`tests/test_client.py`](../tests/test_client.py) and [`tests/test_verificat
 - Changed file bytes after user review.
 - A successful POST response contradicted by a fresh draft status.
 - Native button styles, filtered/paginated assignment lists, safe lossless HTML splitting, callback routing, stale file-removal/discard protection and the button-driven review/save/receipt flow.
+- Notification baseline/discovery, all five reminder thresholds, deadline revisions and schedule replacement, outage catch-up, no-date/submitted/missing work, encrypted-login persistence and deletion, delivery retries, blocked bots, account-switch isolation, Persian deadline conversion and empty-course handling.
 
 The CI matrix runs tests and the offline demo on Windows and Linux, with Python 3.11 and 3.14. CI uses no live-service secrets.
 

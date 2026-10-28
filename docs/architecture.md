@@ -23,6 +23,7 @@ flowchart LR
 | --- | --- | --- |
 | `bot.py` | Private-chat commands, session ownership, document staging, explicit confirmation, receipt formatting | Moodle's submission rules or deadline decisions |
 | `ui.py` | Native colored buttons, menus, filtered/paginated lists, compact receipts, escaped HTML and lossless message splitting | Submission state or permission decisions |
+| `notifications.py` | Encrypted subscriptions, snapshots, deadline revisions, threshold crossings and persistent delivery outbox | Mutating Moodle submissions |
 | `vc_client.py` | Session authentication, form/config parsing, calendar pagination, uploads, download-back hashing, fresh status observations | Telegram users or receipt persistence |
 | `submission.py` | Reviewed manifests, durable attempt states, conservative recovery, receipt ownership | Authentication credentials or homework byte storage |
 | `demo.py` | Offline HTTP simulation using the real client and receipt service | Evidence that the live university accepts submissions |
@@ -68,7 +69,15 @@ This is **conservative recovery, not exactly-once delivery**. Moodle does not pr
 
 Sessions are in memory and indexed by Telegram user. Receipts are scoped to both that Telegram ID and a hash derived from the authenticated Moodle user ID, rather than the supplied username/email alias. One user's account cannot retrieve another user's receipts through the bot. Hashing the account ID is pseudonymization, not encryption; receipt filenames and Telegram IDs remain local metadata that the operator must protect.
 
-Credentials entered through `/connect` pass through Telegram's bot infrastructure. Deleting those chat messages does not make the channel end-to-end encrypted. Persistent credentials are intentionally not implemented. The optional admin `.env` shortcut is restricted to the configured Telegram admin ID.
+Credentials entered through `/connect` pass through Telegram's bot infrastructure. Deleting those chat messages does not make the channel end-to-end encrypted. Interactive sessions remain in memory. An explicit background-alert opt-in persists credentials encrypted with Fernet, with a separate local key, and uses independent HTTP sessions. Signing out also disables alerts and deletes that background login. The configured admin's initial subscription uses the existing server configuration, and its `.env` shortcut is restricted to the configured Telegram admin ID.
+
+## Decision: monitor assignment indices, not just the action timeline
+
+The action timeline can omit completed work. The monitor enumerates enrolled courses and reads each course's assignment index, which includes submitted and undated assignments. KNTU's Jalali deadline strings are parsed explicitly and converted to timezone-aware Tehran timestamps. Unknown formats or unavailable courses fail the entire scan; a partial result never overwrites a known complete snapshot. An expected empty-course notice is handled separately from a real error.
+
+A successful scan atomically saves each assignment's identity, deadline and submitted flag, plus pending alerts. Deadline revisions cancel pending alerts from the old schedule and allow reminders for the new deadline. Initial discovery uses one overview; newly detected assignments get individual notifications after that baseline. Submitted, disappeared, overdue and undated work do not receive deadline reminders. Missed threshold crossings after downtime produce only the nearest relevant reminder.
+
+The outbox deduplicates by Telegram user, university account, assignment, deadline revision and alert kind. It retries transient Telegram errors with backoff and disables subscriptions when the bot is blocked. This is at-least-once delivery: an acknowledgement lost after Telegram accepted a message can cause a duplicate. There is no exactly-once notification guarantee. The monitor is a separate asyncio task with independent Moodle clients, never sharing mutable interactive authentication state. It reports repeated scan failures instead of pretending checks are current.
 
 ## Decision: report timing evidence without inventing precision
 
@@ -82,6 +91,6 @@ Millisecond client timestamps do not reveal the exact instant Moodle committed a
 - The Moodle adapter uses institution-specific web endpoints and markup. An SSO or Moodle upgrade may require changes.
 - File replacement, existing folders and online-text submissions require the web interface.
 - Hosted Telegram transfer limits may be lower than Moodle's file limits.
-- Sessions expire after inactivity and are lost on restart. Receipts survive; staged homework is temporary.
-- New/changed-assignment notifications, a credential-free browser authorization flow, rate limits, and broad public-hosting hardening are not implemented.
+- Interactive sessions expire after inactivity and are lost on restart. Receipts, alert state and opted-in encrypted background logins survive; staged homework is temporary.
+- A credential-free browser authorization flow, rate limits, and broad public-hosting hardening are not implemented.
 - Live authentication and read-only portal operations were exercised. Live assignment save/final-submit behavior remains unverified until a disposable assignment is available.

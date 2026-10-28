@@ -11,12 +11,37 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import dotenv_values
 
 BASE = "https://vc.kntu.ac.ir"
+
+
+def parse_due_date(text):
+    """KNTU's Persian assignment-index dates; never silently guess an unknown date."""
+    import jdatetime
+    text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩يك", "01234567890123456789یک"))
+    text = re.sub(r"[\u200c\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", text).strip()
+    if text in {"", "-", "–", "—", "بدون مهلت", "No due date", "None"}:
+        return None
+    months = "فروردین اردیبهشت خرداد تیر مرداد شهریور مهر آبان آذر دی بهمن اسفند".split()
+    match = re.search(r"(\d{1,2})\s+(" + "|".join(months) + r")\s+(\d{4})[،,\s]+(\d{1,2}):(\d{2})\s*(صبح|عصر|بعدازظهر|قبل\s*ازظهر)?", text)
+    if not match:
+        raise VCError("Unrecognized Moodle due-date format; assignment alerts were not updated.")
+    day, month, year, hour, minute, period = match.groups()
+    hour = int(hour)
+    if period:
+        if not 1 <= hour <= 12:
+            raise VCError("Invalid Moodle 12-hour due date.")
+        hour = hour % 12 + (12 if period in {"عصر", "بعدازظهر"} else 0)
+    try:
+        gregorian = jdatetime.datetime(int(year), months.index(month) + 1, int(day), hour, int(minute)).togregorian()
+        return int(gregorian.replace(tzinfo=ZoneInfo("Asia/Tehran")).timestamp())
+    except ValueError:
+        raise VCError("Invalid Moodle due date; assignment alerts were not updated.") from None
 
 
 class VCError(Exception):
@@ -209,6 +234,51 @@ class VCClient:
         else:
             raise VCError("Calendar is too large; listing would be incomplete.")
         return sorted(events, key=lambda e: e["due"])
+
+    async def notification_assignments(self):
+        """Scan enrolled course indices, including no-date and completed assignments."""
+        await self.ensure_login()
+        courses, offset = [], 0
+        for _ in range(100):
+            data = await self.ajax("core_course_get_enrolled_courses_by_timeline_classification",
+                                   {"classification": "all", "limit": 100, "offset": offset})
+            batch = data.get("courses", [])
+            courses.extend(batch)
+            if len(batch) < 100:
+                break
+            next_offset = data.get("nextoffset")
+            if not isinstance(next_offset, int) or next_offset <= offset:
+                raise VCError("Enrolled course pagination stalled. Alert scan was not saved.")
+            offset = next_offset
+        else:
+            raise VCError("Too many enrolled courses; alert scan would be incomplete.")
+        events = {}
+        for course in courses:
+            response = await self.get(f"/mod/assign/index.php?id={int(course['id'])}&lang=fa")
+            doc = soup(response.text)
+            if doc.select_one("form#kc-form-login, input#username") or "sso.kntu.ac.ir" in str(response.url):
+                raise VCError("Assignment alert session expired during scan.")
+            if not doc.body or doc.body.get("id") != "page-mod-assign-index":
+                raise VCError("Unexpected course assignment page; alert scan was not saved.")
+            for alert in doc.select(".alert-danger, .errorbox"):
+                # Moodle renders an ordinary empty course with alert-danger too.
+                message = alert.get_text(" ", strip=True)
+                if not any(empty in message for empty in ("هیچ موردی از تکالیف در این درس وجود ندارد", "There are no assignments in this course")):
+                    raise VCError("A course assignment index was unavailable; alert scan was not saved.")
+            for row in doc.select("table.generaltable tbody tr"):
+                a = row.select_one('a[href*="/mod/assign/view.php"]')
+                if not a:
+                    continue
+                cells = row.find_all("td", recursive=False)
+                if len(cells) < 4:
+                    raise VCError("Unknown assignment index layout; alert scan was not saved.")
+                cmid = int(parse_qs(urlparse(a["href"]).query)["id"][0])
+                due = parse_due_date(cells[-3].get_text(" ", strip=True))
+                status = cells[-2].get_text(" ", strip=True)
+                submitted = status in {"برای تصحیح تحویل داده شده است", "Submitted for grading"} or bool(row.select_one(".submissionstatussubmitted"))
+                events[cmid] = {"id": cmid, "name": a.get_text(" ", strip=True), "course": course["fullname"],
+                                "due": due, "submitted": submitted}
+        return list(events.values())
 
     async def detail(self, cmid):
         await self.ensure_login()

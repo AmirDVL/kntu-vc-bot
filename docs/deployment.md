@@ -17,6 +17,8 @@ The deployment uses a dedicated `kntu-vc-bot` system user. Source releases and t
 
 The environment file uses the canonical keys from `.env.example`: `KNTU_USERNAME`, `KNTU_PASSWORD`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_USER_ID`. It is read by systemd, not placed in the repository or source release. SSH credentials and the private key stay on the operator's machine and must never be committed.
 
+Background alerts use `notifications.sqlite3` and `notifications.key` in the persistent state directory. Systemd's `UMask=0077` restricts file permissions, and the key is created with mode 0600. Preserve the existing key on upgrades; startup refuses to replace a missing key when encrypted logins already exist. Back up the database and key securely, preferably separately. The configured admin is subscribed on the first notification-enabled startup; a disabled admin subscription remains disabled on restart. Other users enable background login persistence explicitly in the bot.
+
 ## Service operations
 
 ```sh
